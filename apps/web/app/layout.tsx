@@ -34,7 +34,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                 target="_blank"
                 rel="noreferrer"
               >
-                Project source code
+                GitHub repo
               </a>
             </header>
             {children}

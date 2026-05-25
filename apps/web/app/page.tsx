@@ -6,21 +6,16 @@ import {
   Braces,
   ChevronLeft,
   ChevronRight,
-  Code2,
-  Container,
+  CheckCircle2,
   EyeOff,
   Layers3,
   Play,
   Radio,
-  RefreshCw,
   Send,
   ShieldCheck,
   Shuffle,
-  Terminal
 } from "lucide-react";
 import type {
-  ArtifactDetail,
-  ArtifactSummary,
   BuilderSession,
   CapturedEvent,
   GenerationRunSummary,
@@ -33,8 +28,6 @@ import {
   createBuilderSession,
   createSolaceSubscription,
   generateBuilderSession,
-  getArtifact,
-  getArtifacts,
   getWorkerJob,
   listCapturedEvents,
   sendBuilderMessage,
@@ -51,6 +44,31 @@ function languageLabel(language: TransformLanguage) {
     groovy: "Groovy",
     dataweave: "DataWeave"
   }[language];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function byteSize(value: unknown) {
+  return new TextEncoder().encode(JSON.stringify(value ?? {})).length;
+}
+
+function formatBytes(value: unknown) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return "pending";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function formatThroughput(value: unknown) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return "pending";
+  return `${Math.round(value).toLocaleString()} events/s`;
+}
+
+function resultNumber(result: Record<string, unknown>, key: string) {
+  const value = result[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 const languageOptions: Array<{ value: TransformLanguage; label: string; note: string }> = [
@@ -111,17 +129,13 @@ export default function HomePage() {
   const [chatInput, setChatInput] = useState("");
   const [generatedRun, setGeneratedRun] = useState<GenerationRunSummary | null>(null);
   const [workerJob, setWorkerJob] = useState<WorkerJob | null>(null);
-  const [artifacts, setArtifacts] = useState<ArtifactSummary[]>([]);
-  const [activeArtifact, setActiveArtifact] = useState<ArtifactDetail | null>(null);
   const [working, setWorking] = useState(false);
-  const [message, setMessage] = useState("Ready");
   const [liveDesignStatus, setLiveDesignStatus] = useState("Select a source event");
   const [liveDesigning, setLiveDesigning] = useState(false);
   const [questionChecklist, setQuestionChecklist] = useState<Record<string, boolean>>({});
   const eventSourceRef = useRef<EventSource | null>(null);
   const builderPaneRef = useRef<HTMLElement | null>(null);
   const outputPaneRef = useRef<HTMLElement | null>(null);
-  const projectPaneRef = useRef<HTMLElement | null>(null);
 
   const questions = useMemo(
     () => builderSession?.draft?.qualifyingQuestions ?? [],
@@ -137,6 +151,10 @@ export default function HomePage() {
   const generationFinished = Boolean(
     workerJob && ["completed", "failed", "partial"].includes(workerJob.status)
   );
+  const chatMessages = builderSession?.messages ?? [];
+  const hasAssistantMessage = chatMessages.some((chat) => chat.role === "assistant");
+  const showStatusMessage =
+    working || liveDesigning || liveDesignStatus !== "Select a source event";
 
   useEffect(() => {
     if (!subscription) return;
@@ -152,7 +170,7 @@ export default function HomePage() {
       setSelectedEvent((current) => current ?? captured);
     };
     source.onerror = () => {
-      setMessage("Capture stream reconnecting");
+      setLiveDesignStatus("Capture stream reconnecting");
     };
     listCapturedEvents(subscription.id)
       .then((events) => {
@@ -200,7 +218,21 @@ export default function HomePage() {
     return builderSession?.preview ?? builderSession?.draft?.sampleOutput ?? {};
   }, [builderSession]);
 
-  const draftFiles = builderSession?.draft?.files ?? [];
+  const topicDestination =
+    builderSession?.draft?.topicMapping?.outputTopic ??
+    generatedRun?.canonicalModel?.topics?.[0] ??
+    "Waiting for transform";
+  const workerResult = isRecord(workerJob?.result) ? workerJob.result : {};
+  const sampleInputBytes =
+    resultNumber(workerResult, "sampleInputBytes") ?? byteSize(selectedEvent?.payload);
+  const sampleOutputBytes =
+    resultNumber(workerResult, "sampleOutputBytes") ?? byteSize(selectedOutput);
+  const estimatedThroughput =
+    resultNumber(workerResult, "eventThroughputPerSecond") ??
+    Math.max(1000, Math.min(50000, Math.round(120_000_000 / Math.max(sampleInputBytes, 512))));
+  const p95Latency = resultNumber(workerResult, "p95LatencyMs");
+  const imageSize = resultNumber(workerResult, "imageSizeBytes");
+  const templatesVisible = !selectedTemplate && !builderSession?.draft && !chatInput.trim();
 
   async function applyTemplate(templateKey: string) {
     const template = templateOptions.find((option) => option.key === templateKey);
@@ -216,7 +248,7 @@ export default function HomePage() {
 
   async function startCapture() {
     setWorking(true);
-    setMessage("Starting capture");
+    setLiveDesignStatus("Starting capture");
     try {
       const nextSubscription = await createSolaceSubscription({
         brokerUrl,
@@ -234,9 +266,9 @@ export default function HomePage() {
       setQuestionChecklist({});
       setSelectedTemplate(null);
       setChatInput("");
-      setMessage(nextSubscription.message);
+      setLiveDesignStatus(nextSubscription.message);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Capture failed");
+      setLiveDesignStatus(error instanceof Error ? error.message : "Capture failed");
     } finally {
       setWorking(false);
     }
@@ -258,7 +290,6 @@ export default function HomePage() {
     if (!prompt || working || liveDesigning) return;
     setWorking(true);
     setLiveDesigning(true);
-    setMessage("Drafting integration");
     setLiveDesignStatus(status);
     try {
       const session = await ensureSession();
@@ -268,7 +299,6 @@ export default function HomePage() {
       });
       setBuilderSession(updated);
       setChatInput("");
-      setMessage("Draft updated");
       setLiveDesignStatus("Draft updated. Answer the checklist, then generate the project.");
       window.requestAnimationFrame(() => {
         outputPaneRef.current?.scrollIntoView({
@@ -278,7 +308,7 @@ export default function HomePage() {
         });
       });
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Unable to draft");
+      setLiveDesignStatus(error instanceof Error ? error.message : "Unable to draft");
     } finally {
       setWorking(false);
       setLiveDesigning(false);
@@ -292,7 +322,6 @@ export default function HomePage() {
   async function generate() {
     if (generateDisabled) return;
     setWorking(true);
-    setMessage("Generating project");
     setLiveDesignStatus("Rendering the template project around the current transform");
     try {
       const session = await ensureSession();
@@ -300,32 +329,21 @@ export default function HomePage() {
       setBuilderSession(result.session);
       setGeneratedRun(result.run);
       setWorkerJob(result.workerJob);
-      setMessage("Project generated");
       setLiveDesignStatus(
         "Project generated. Security, performance, Maven, and Docker checks are running."
       );
-      const nextArtifacts = await getArtifacts(result.run.id);
-      setArtifacts(nextArtifacts);
-      if (nextArtifacts[0]) {
-        setActiveArtifact(await getArtifact(result.run.id, nextArtifacts[0].id));
-      }
       window.requestAnimationFrame(() => {
-        projectPaneRef.current?.scrollIntoView({
+        outputPaneRef.current?.scrollIntoView({
           behavior: "smooth",
           block: "nearest",
           inline: "center"
         });
       });
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Generation failed");
+      setLiveDesignStatus(error instanceof Error ? error.message : "Generation failed");
     } finally {
       setWorking(false);
     }
-  }
-
-  async function openArtifact(artifact: ArtifactSummary) {
-    if (!generatedRun) return;
-    setActiveArtifact(await getArtifact(generatedRun.id, artifact.id));
   }
 
   return (
@@ -438,8 +456,6 @@ export default function HomePage() {
                     setQuestionChecklist({});
                     setGeneratedRun(null);
                     setWorkerJob(null);
-                    setArtifacts([]);
-                    setActiveArtifact(null);
                   }}
                 >
                   <Activity size={16} />
@@ -480,124 +496,120 @@ export default function HomePage() {
           </div>
         </div>
 
-        {working || liveDesigning ? (
-          <div className="builder-activity" aria-live="polite">
-            <RefreshCw size={14} className="spin" />
-            <span>{message}</span>
+        <div className="chat-box">
+          <div className="messages">
+            {!chatMessages.length && !builderSession?.draft ? (
+              <article className="message system-message" data-role="assistant">
+                <span>builder</span>
+                <p>
+                  {selectedEvent
+                    ? "Pick a template or describe a small transform. I will ask two or three questions, then generate a focused micro integration."
+                    : "Select a live event first. Then choose a template or describe the transform."}
+                </p>
+              </article>
+            ) : null}
+            {templatesVisible ? (
+              <article className="message template-message" data-role="assistant">
+                <span>start with</span>
+                <div className="template-grid">
+                  {templateOptions.map((template) => {
+                    const Icon = template.icon;
+                    return (
+                      <button
+                        type="button"
+                        className="template-button"
+                        key={template.key}
+                        disabled={working || liveDesigning || !selectedEvent}
+                        onClick={() => void applyTemplate(template.key)}
+                      >
+                        <Icon size={16} />
+                        <span>{template.label}</span>
+                        <small>{template.note}</small>
+                      </button>
+                    );
+                  })}
+                </div>
+              </article>
+            ) : null}
+            {chatMessages.map((chat) => (
+              <article key={chat.id} className="message" data-role={chat.role}>
+                <span>{chat.role}</span>
+                <p>{chat.content}</p>
+              </article>
+            ))}
+            {builderSession?.draft?.assistantMessage && !hasAssistantMessage ? (
+              <article className="message" data-role="assistant">
+                <span>builder</span>
+                <p>{builderSession.draft.assistantMessage}</p>
+              </article>
+            ) : null}
+            {showStatusMessage ? (
+              <article className="message status-message" data-role="assistant" aria-live="polite">
+                <span>working</span>
+                <p>{liveDesignStatus}</p>
+              </article>
+            ) : null}
+            {questions.length ? (
+              <article className="message checklist-message" data-role="assistant">
+                <span>{readyToGenerate ? "ready" : "question checklist"}</span>
+                <div className="question-items">
+                  {questions.map((question) => (
+                    <label key={question} className="question-item">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(questionChecklist[question])}
+                        onChange={(event) =>
+                          setQuestionChecklist((current) => ({
+                            ...current,
+                            [question]: event.target.checked
+                          }))
+                        }
+                      />
+                      <span>{question}</span>
+                    </label>
+                  ))}
+                </div>
+                {readyToGenerate ? (
+                  <div className="ready-strip">
+                    <CheckCircle2 size={14} />
+                    <span>Ready to generate</span>
+                  </div>
+                ) : null}
+              </article>
+            ) : null}
           </div>
-        ) : null}
 
-        <div className="messages">
-          {builderSession?.draft?.assistantMessage ? (
-            <article className="message" data-role="assistant">
-              <span>assistant</span>
-              <p>{builderSession.draft.assistantMessage}</p>
-            </article>
-          ) : null}
-          {working || liveDesigning ? (
-            <article className="message status-message" data-role="assistant" aria-live="polite">
-              <span>working</span>
-              <p>{liveDesignStatus}</p>
-            </article>
-          ) : null}
-          {builderSession?.draft?.qualifyingQuestions?.length ? (
-            <article className="message" data-role="assistant">
-              <span>questions</span>
-              <ul className="question-list">
-                {builderSession.draft.qualifyingQuestions.map((question) => (
-                  <li key={question}>{question}</li>
-                ))}
-              </ul>
-            </article>
-          ) : null}
-          {(builderSession?.messages ?? []).map((chat) => (
-            <article key={chat.id} className="message" data-role={chat.role}>
-              <span>{chat.role}</span>
-              <p>{chat.content}</p>
-            </article>
-          ))}
-        </div>
-
-        {questions.length ? (
-          <div className="question-checklist">
-            <div className="section-row">
-              <strong>Question checklist</strong>
-              <span>{readyToGenerate ? "Ready to generate" : "Answer and check"}</span>
-            </div>
-            <div className="question-items">
-              {questions.map((question) => (
-                <label key={question} className="question-item">
-                  <input
-                    type="checkbox"
-                    checked={Boolean(questionChecklist[question])}
-                    onChange={(event) =>
-                      setQuestionChecklist((current) => ({
-                        ...current,
-                        [question]: event.target.checked
-                      }))
-                    }
-                  />
-                  <span>{question}</span>
-                </label>
-              ))}
-            </div>
-          </div>
-        ) : null}
-
-        {readyToGenerate ? <div className="ready-strip">Ready to generate</div> : null}
-
-        <div className="composer">
-          <textarea
-            placeholder={`Describe the ${languageLabel(language)} transform.`}
-            value={chatInput}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                if (!working && chatInput.trim()) {
-                  void sendMessage();
-                }
+          <div className="composer">
+            <textarea
+              placeholder={
+                selectedEvent
+                  ? `Describe the ${languageLabel(language)} transform.`
+                  : "Select a source event first."
               }
-            }}
-            onChange={(event) => {
-              setSelectedTemplate(null);
-              setChatInput(event.target.value);
-            }}
-          />
-          <div className="composer-actions">
+              value={chatInput}
+              disabled={!selectedEvent}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  if (!working && chatInput.trim()) {
+                    void sendMessage();
+                  }
+                }
+              }}
+              onChange={(event) => {
+                setSelectedTemplate(null);
+                setChatInput(event.target.value);
+              }}
+            />
             <button
               type="button"
-              className="icon-button primary"
+              className="send-button"
+              aria-label="Send"
               onClick={sendMessage}
-              disabled={working || !chatInput.trim()}
+              disabled={working || !chatInput.trim() || !selectedEvent}
             >
-              <Send size={17} />
+              <Send size={18} />
             </button>
-          </div>
-        </div>
-
-        <div className="template-block">
-          <div className="section-row template-head">
-            <strong>Templates</strong>
-            <span>start here</span>
-          </div>
-          <div className="template-grid">
-            {templateOptions.map((template) => {
-              const Icon = template.icon;
-              return (
-                <button
-                  type="button"
-                  className="template-button"
-                  data-active={selectedTemplate === template.key}
-                  key={template.key}
-                  disabled={working || liveDesigning}
-                  onClick={() => void applyTemplate(template.key)}
-                >
-                  <Icon size={16} />
-                  <span>{template.label}</span>
-                  <small>{template.note}</small>
-                </button>
-              );
-            })}
           </div>
         </div>
       </section>
@@ -612,6 +624,44 @@ export default function HomePage() {
 
         <div className="output-preview">
           <pre>{prettyJson(selectedOutput)}</pre>
+        </div>
+
+        <div className="output-metadata">
+          <div className="topic-destination">
+            <span>Topic destination</span>
+            <strong>{topicDestination}</strong>
+          </div>
+          <div className="benchmark-grid" aria-label="Generation benchmarks">
+            <div>
+              <span>Event throughput</span>
+              <strong>{formatThroughput(estimatedThroughput)}</strong>
+            </div>
+            <div>
+              <span>Image size</span>
+              <strong>{formatBytes(imageSize)}</strong>
+            </div>
+            <div>
+              <span>Payload</span>
+              <strong>{formatBytes(sampleInputBytes)}</strong>
+            </div>
+            <div>
+              <span>Sample output</span>
+              <strong>{formatBytes(sampleOutputBytes)}</strong>
+            </div>
+            <div>
+              <span>p95 latency</span>
+              <strong>{p95Latency ? `${p95Latency.toFixed(2)} ms` : "pending"}</strong>
+            </div>
+            <div>
+              <span>Build</span>
+              <strong>{workerJob?.status ?? "idle"}</strong>
+            </div>
+          </div>
+          {generatedRun ? (
+            <a className="project-download" href={workspaceArchiveUrl(generatedRun.id)}>
+              VS Code project
+            </a>
+          ) : null}
         </div>
 
         <button
@@ -632,65 +682,6 @@ export default function HomePage() {
                   : "Complete Checklist"}
           </span>
         </button>
-      </section>
-
-      <section className="pane project-pane" aria-label="Project" ref={projectPaneRef}>
-        <div className="project-sidebar">
-          <div className="section-row">
-            <strong>Project</strong>
-            {generatedRun ? (
-              <a className="project-download" href={workspaceArchiveUrl(generatedRun.id)}>
-                VS Code project
-              </a>
-            ) : (
-              <Code2 size={16} />
-            )}
-          </div>
-          <div className="file-tree">
-            {artifacts.length
-              ? artifacts.map((artifact) => (
-                  <button
-                    type="button"
-                    key={artifact.id}
-                    data-active={activeArtifact?.id === artifact.id}
-                    onClick={() => void openArtifact(artifact)}
-                  >
-                    {artifact.path}
-                  </button>
-                ))
-              : draftFiles.map((file) => (
-                  <div className="file-placeholder" key={file.path}>
-                    <span>{file.path}</span>
-                    <small>{file.purpose}</small>
-                  </div>
-                ))}
-          </div>
-        </div>
-
-        <div className="code-surface">
-          <div className="section-row">
-            <strong>{activeArtifact?.path ?? "Generated code"}</strong>
-            <Terminal size={16} />
-          </div>
-          <pre>{activeArtifact?.content ?? prettyJson(builderSession?.draft)}</pre>
-        </div>
-
-        <div className="worker-panel">
-          <div className="section-row">
-            <strong>Tests & Build</strong>
-            <Container size={16} />
-          </div>
-          <div className="worker-status">
-            <span>{workerJob?.status ?? "idle"}</span>
-            {workerJob && !["completed", "failed", "partial"].includes(workerJob.status) ? (
-              <RefreshCw size={15} className="spin" />
-            ) : null}
-          </div>
-          <pre>
-            {workerJob?.logs ||
-              "Security, performance, Maven, VS Code, and Docker logs appear here after generation."}
-          </pre>
-        </div>
       </section>
     </main>
   );
